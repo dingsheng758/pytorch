@@ -18,7 +18,9 @@ from torch.fx.experimental import _config as exp_config
 from torch.testing import make_tensor
 from torch.testing._internal.common_utils import unMarkDynamoStrictTest
 from torch.testing._internal.common_utils import (
+    HardwareClassification,
     TestCase,
+    instantiate_parametrized_tests,
     skipIfCrossRef,
     skipIfTorchDynamo,
     suppress_warnings,
@@ -31,8 +33,6 @@ from torch.testing._internal.common_utils import (
 from torch.testing._internal.common_device_type import (
     ops,
     instantiate_device_type_tests,
-    onlyCUDA,
-    onlyCPU,
     OpDTypes,
     skipOps,
     xfail,
@@ -91,6 +91,8 @@ foreach_op_db = (
 
 
 class TestMetaConverter(TestCase):
+    hw_classification = HardwareClassification.GENERIC
+
     def assertSameVersionCounter(self, m1, m2):
         # Cannot easily test m1 and m2 have same storage due to
         # lack of Storage bindings.  Use version counter.
@@ -1155,6 +1157,8 @@ class MetaCrossRefDispatchMode(torch.utils._python_dispatch.TorchDispatchMode):
 # with the inconsistencies but this takes time.
 @unMarkDynamoStrictTest
 class TestMeta(TestCase):
+    hw_classification = HardwareClassification.CUDA
+
     # Copies inputs to inplace operations to avoid inplace modifications
     #   to leaves requiring gradient
     def _get_safe_inplace(self, inplace_variant):
@@ -1558,7 +1562,6 @@ class TestMeta(TestCase):
     ))
     @ops(itertools.chain(op_db, foreach_op_db), dtypes=OpDTypes.any_common_cpu_cuda_one)
     # Only test on CUDA, as CUDA kernel's stride is the reference
-    @onlyCUDA
     def test_dispatch_symbolic_meta_outplace_all_strides(self, device, dtype, op):
         self._run_dispatch_meta_test(device, dtype, op, symbolic_meta=True, inplace=False, all_stride_variants=True)
 
@@ -1583,7 +1586,6 @@ class TestMeta(TestCase):
     ))
     @ops(itertools.chain(op_db, foreach_op_db), dtypes=OpDTypes.any_common_cpu_cuda_one)
     # Only test on CUDA, as CUDA kernel's stride is the reference
-    @onlyCUDA
     def test_dispatch_symbolic_meta_inplace_all_strides(self, device, dtype, op):
         self._run_dispatch_meta_test(device, dtype, op, symbolic_meta=True, inplace=True, all_stride_variants=True)
 
@@ -1603,7 +1605,6 @@ class TestMeta(TestCase):
     ))
     @ops(binary_ufuncs, allowed_dtypes=(torch.float32,))
     # Only test on CUDA, as CUDA kernel's stride is the reference
-    @onlyCUDA
     def test_binary_ufuncs_mixed_dtype(self, device, dtype, op):
         make_arg = partial(
             make_tensor,
@@ -1620,189 +1621,42 @@ class TestMeta(TestCase):
 
         self._run_dispatch_meta_test(device, dtype, op, symbolic_meta=True, inplace=False)
 
+    # opinfo test is using aten.fill_, it's not testing aten.fill
+    def test_fill_stride(self, device):
+        to_meta = MetaConverter()
+        sample_args = [torch.rand(2, 2, 2, 2, device=device), 1.0]
 
-    def test_empty_quantized(self):
-        r = torch.empty(2 ** 52, device='meta', dtype=torch.qint8)
-        self.assertEqual(r.device.type, 'meta')
+        for args in get_strided_args(sample_args):
+            meta_args = to_meta(args)
+            ref_out = torch.ops.aten.fill(*args)
+            meta_out = torch.ops.aten.fill(*meta_args)
+            self.assertEqual(ref_out.size(), meta_out.size())
+            self.assertEqual(ref_out.stride(), meta_out.stride())
 
-    def test_nan_to_num(self):
-        t = torch.tensor([float('nan'), float('inf'), -float('inf'), 3.14], device='meta')
-        r = t.nan_to_num()
-        self.assertEqual(r.device.type, 'meta')
+    def _assert_fft_meta_stride_matches_eager(self, op, *args):
+        to_meta = MetaConverter()
+        meta_args = tree_map_only(torch.Tensor, to_meta, args)
+        ref_out = op(*args)
+        meta_out = op(*meta_args)
+        self.assertEqual(ref_out.size(), meta_out.size())
+        self.assertEqual(ref_out.stride(), meta_out.stride())
 
-    def test_inplace_masked_fill_error(self):
-        t = torch.randn(3, 3, device='meta')
-        with self.assertRaisesRegex(RuntimeError, "doesn't match the broadcast"):
-            t.masked_fill_((t > 0).unsqueeze(0), 0.1)
-
-    def test_inplace_bin_ops_error(self):
-        t = torch.randn(3, 3, device='meta')
-        for op in (torch.Tensor.add_, torch.Tensor.sub_, torch.Tensor.mul_, torch.Tensor.div_,
-                   torch.Tensor.logical_and_, torch.Tensor.logical_or_, torch.Tensor.logical_xor_):
-            with self.assertRaisesRegex(RuntimeError, "doesn't match the broadcast"):
-                op(t, t.clone().unsqueeze(0))
-
-    @onlyCPU
-    def test_meta_autograd_no_error(self):
-        with torch.library._scoped_library("meta_test", "DEF") as lib:
-            with torch.library._scoped_library("meta_test", "IMPL", "CPU") as impl_cpu:
-                with torch.library._scoped_library("meta_test", "IMPL", "Meta") as impl_meta:
-                    def foo_impl(x):
-                        return x + 1
-
-                    lib.define("foo(Tensor a) -> Tensor")
-                    impl_meta.impl("foo", foo_impl)
-                    impl_cpu.impl("foo", foo_impl)
-
-                    a = torch.ones(2, device='meta')
-                    # The point of the test is that this should not error:
-                    # We have a fallthrough kernel registered to the AutogradMeta
-                    # key for custom ops, so it's fine that `foo()` doesn't have
-                    # an autograd kernel.
-                    b = torch.ops.meta_test.foo.default(a)
-
-    def test_huber_loss_backward(self):
-        inps = [torch.rand(2**52, device='meta') for _ in range(3)]
-        r = torch.ops.aten.huber_loss_backward(*inps, 0, 1.0)
-        self.assertEqual(r.device.type, 'meta')
-        self.assertEqual(r.shape, inps[0].shape)
-
-    def _norm_backwards_test_helper(self, op, args, output_mask, expected_shapes):
-
-        dtype = torch.float32
-        device = "meta"
-
-        # test functional call
-        grads = op(*args, output_mask)
-
-        def assertEqualShapes(res, exp):
-            self.assertIsNone(res) if exp is None else self.assertEqual(exp, res.shape)
-
-        assertEqualShapes(grads[0], expected_shapes[0])
-        assertEqualShapes(grads[1], expected_shapes[1])
-        assertEqualShapes(grads[2], expected_shapes[2])
-
-        out_kwargs = {
-            f"out{i}": torch.empty(0, device=device, dtype=dtype)
-            for i in range(len(output_mask))
-        }
-
-        # test call with out parameters
-        grads = op(*args, output_mask, **out_kwargs)
-
-        def assertEqualShapes(res, exp):
-            self.assertEqual(exp, res.shape) if exp is not None else True
-
-        assertEqualShapes(out_kwargs["out0"], expected_shapes[0])
-        assertEqualShapes(out_kwargs["out1"], expected_shapes[1])
-        assertEqualShapes(out_kwargs["out2"], expected_shapes[2])
-
-    @onlyCPU
-    @parametrize("output_mask", list(itertools.product([True, False], [True, False], [True, False])))
-    def test_layer_norm_backward(self, output_mask):
-        from torch.testing._internal.common_methods_invocations import sample_inputs_layer_norm
-
-        device = "meta"
-        dtype = torch.float32
-
-        samples = sample_inputs_layer_norm(None, device, dtype, requires_grad=False)
-
-        for sample in samples:
-            with self.subTest(sample=sample):
-                # handle optional weight and bias
-                if len(sample.args) != 3:
-                    sample.args = (*sample.args, *([None] * (3 - len(sample.args))))
-
-                grad_out = torch.ones_like(sample.input)
-                normalized_shape, weight, bias = sample.args
-                ndims_after_reduction = sample.input.ndim - len(normalized_shape)
-                mean_shape = grad_out.shape[:ndims_after_reduction]
-                mean = torch.zeros(mean_shape, device=device, dtype=dtype)
-                rstd = torch.zeros(mean_shape, device=device, dtype=dtype)
-
-                expected_shapes = (
-                    sample.input.shape if output_mask[0] else None,
-                    weight.shape if output_mask[1] and weight is not None else None,
-                    bias.shape if output_mask[2] and bias is not None else None)
-
-                args = [grad_out, sample.input, normalized_shape, mean, rstd, weight, bias]
-
-                self._norm_backwards_test_helper(torch.ops.aten.native_layer_norm_backward,
-                                                 args, output_mask, expected_shapes)
-
-    @onlyCPU
-    @parametrize("output_mask", list(itertools.product([True, False], [True, False], [True, False])))
-    def test_group_norm_backward(self, output_mask):
-        from torch.testing._internal.common_methods_invocations import sample_inputs_group_norm
-
-        # input, (args) num_groups, (kwargs) weight, bias eps
-        device = "meta"
-        dtype = torch.float32
-        samples = sample_inputs_group_norm(None, device, dtype, requires_grad=False)
-
-        for sample in samples:
-            with self.subTest(sample=sample):
-                grad_out = torch.ones_like(sample.input)
-                N, C = sample.input.shape[:2]
-                HxW = torch.prod(torch.as_tensor(sample.input.shape[2:]), dtype=torch.int32).item()
-                group = sample.args[0]
-                mean = torch.zeros((N, group), device=device, dtype=dtype)
-                rstd = torch.zeros((N, group), device=device, dtype=dtype)
-                weight = torch.zeros((C), device=device, dtype=dtype)
-
-                args = [grad_out, sample.input, mean, rstd, weight, N, C, HxW, group]
-
-                expected_shapes = (
-                    sample.input.shape if output_mask[0] else None,
-                    weight.shape if output_mask[1] else None,
-                    weight.shape if output_mask[2] else None)
-
-                # test functional call
-                self._norm_backwards_test_helper(torch.ops.aten.native_group_norm_backward,
-                                                 args, output_mask, expected_shapes)
-
-    @onlyCPU
-    @parametrize("output_mask", list(itertools.product([True], [True, False], [True, False])))
-    def test_batch_norm_backward(self, output_mask):
-        from torch.testing._internal.common_methods_invocations import sample_inputs_batch_norm
-
-        # input, (args) num_groups, (kwargs) weight, bias eps
-        device = "meta"
-        dtype = torch.float32
-        samples = sample_inputs_batch_norm(None, device, dtype, requires_grad=False)
-
-        for sample in samples:
-            with self.subTest(sample=sample):
-
-                if sample.input.dim() < 2:
-                    continue
-
-                grad_out = torch.ones_like(sample.input)
-                running_mean, running_var, weight, bias = sample.args
-                train = sample.kwargs.get("training", True)
-                save_mean = torch.zeros((sample.input.shape[1], ), device=device, dtype=dtype) if train else None
-                save_invstd = torch.zeros((sample.input.shape[1], ), device=device, dtype=dtype) if train else None
-
-                args = [grad_out, sample.input, weight, running_mean, running_var,
-                        save_mean, save_invstd, train, sample.kwargs.get("eps", 1e-5)]
-
-                expected_shapes = (
-                    sample.input.shape,
-                    torch.Size([sample.input.shape[1]]) if output_mask[1] else None,
-                    torch.Size([sample.input.shape[1]]) if output_mask[2] else None)
-
-                self._norm_backwards_test_helper(torch.ops.aten.native_batch_norm_backward,
-                                                 args, output_mask, expected_shapes)
-
-    def test_fill__alias_relationship(self):
-        inps = torch.rand(2**52, device='meta')
-        r = torch.ops.aten.fill_(inps, 1.0)
-        # aten.fill_ returns an alias
-        self.assertEqual(id(inps), id(r))
-
-        # aten.fill returns a new tensor
-        r2 = torch.ops.aten.fill(inps, 1.0)
-        self.assertNotEqual(id(inps), id(r2))
+    @unittest.skipIf(torch.version.hip, "cuFFT-specific stride behavior")
+    def test_fft_multi_dim_cufft_stride_matches_meta(self, device):
+        self._assert_fft_meta_stride_matches_eager(
+            aten._fft_c2c.default,
+            torch.randn((5, 5, 5, 5, 5), device=device, dtype=torch.complex64),
+            [1, 2, 3, 4],
+            0,
+            True,
+        )
+        self._assert_fft_meta_stride_matches_eager(
+            aten._fft_c2r.default,
+            torch.randn((5, 5, 5, 5, 3), device=device, dtype=torch.complex64),
+            [0, 1, 2, 3, 4],
+            0,
+            5,
+        )
 
     def test_meta__fused_moving_avg_obs_fq_helper(self, device):
         from torch.ao.quantization import FusedMovingAvgObsFakeQuantize
@@ -1864,6 +1718,201 @@ class TestMeta(TestCase):
             res = aten._cdist_forward.default(to_meta(x1), to_meta(x2), p, compute_mode)
             self.assertEqual(res.device.type, 'meta')
             self.assertEqual(ref.shape, res.shape)
+
+@instantiate_parametrized_tests
+class TestMetaCore(TestCase):
+    hw_classification = HardwareClassification.GENERIC
+
+    def test_empty_quantized(self):
+        r = torch.empty(2 ** 52, device='meta', dtype=torch.qint8)
+        self.assertEqual(r.device.type, 'meta')
+
+    def test_nan_to_num(self):
+        t = torch.tensor([float('nan'), float('inf'), -float('inf'), 3.14], device='meta')
+        r = t.nan_to_num()
+        self.assertEqual(r.device.type, 'meta')
+
+    def test_inplace_masked_fill_error(self):
+        t = torch.randn(3, 3, device='meta')
+        with self.assertRaisesRegex(RuntimeError, "doesn't match the broadcast"):
+            t.masked_fill_((t > 0).unsqueeze(0), 0.1)
+
+    def test_inplace_bin_ops_error(self):
+        t = torch.randn(3, 3, device='meta')
+        for op in (torch.Tensor.add_, torch.Tensor.sub_, torch.Tensor.mul_, torch.Tensor.div_,
+                   torch.Tensor.logical_and_, torch.Tensor.logical_or_, torch.Tensor.logical_xor_):
+            with self.assertRaisesRegex(RuntimeError, "doesn't match the broadcast"):
+                op(t, t.clone().unsqueeze(0))
+
+    def test_meta_autograd_no_error(self):
+        with torch.library._scoped_library("meta_test", "DEF") as lib:
+            with torch.library._scoped_library("meta_test", "IMPL", "CPU") as impl_cpu:
+                with torch.library._scoped_library("meta_test", "IMPL", "Meta") as impl_meta:
+                    def foo_impl(x):
+                        return x + 1
+
+                    lib.define("foo(Tensor a) -> Tensor")
+                    impl_meta.impl("foo", foo_impl)
+                    impl_cpu.impl("foo", foo_impl)
+
+                    a = torch.ones(2, device='meta')
+                    # The point of the test is that this should not error:
+                    # We have a fallthrough kernel registered to the AutogradMeta
+                    # key for custom ops, so it's fine that `foo()` doesn't have
+                    # an autograd kernel.
+                    b = torch.ops.meta_test.foo.default(a)
+
+    def test_huber_loss_backward(self):
+        inps = [torch.rand(2**52, device='meta') for _ in range(3)]
+        r = torch.ops.aten.huber_loss_backward(*inps, 0, 1.0)
+        self.assertEqual(r.device.type, 'meta')
+        self.assertEqual(r.shape, inps[0].shape)
+
+    def _norm_backwards_test_helper(self, op, args, output_mask, expected_shapes):
+
+        dtype = torch.float32
+        device = "meta"
+
+        # test functional call
+        grads = op(*args, output_mask)
+
+        def assertEqualShapes(res, exp):
+            self.assertIsNone(res) if exp is None else self.assertEqual(exp, res.shape)
+
+        assertEqualShapes(grads[0], expected_shapes[0])
+        assertEqualShapes(grads[1], expected_shapes[1])
+        assertEqualShapes(grads[2], expected_shapes[2])
+
+        out_kwargs = {
+            f"out{i}": torch.empty(0, device=device, dtype=dtype)
+            for i in range(len(output_mask))
+        }
+
+        # test call with out parameters
+        grads = op(*args, output_mask, **out_kwargs)
+
+        def assertEqualShapes(res, exp):
+            self.assertEqual(exp, res.shape) if exp is not None else True
+
+        assertEqualShapes(out_kwargs["out0"], expected_shapes[0])
+        assertEqualShapes(out_kwargs["out1"], expected_shapes[1])
+        assertEqualShapes(out_kwargs["out2"], expected_shapes[2])
+
+    @parametrize("output_mask", list(itertools.product([True, False], [True, False], [True, False])))
+    def test_layer_norm_backward(self, output_mask):
+        from torch.testing._internal.common_methods_invocations import sample_inputs_layer_norm
+
+        device = "meta"
+        dtype = torch.float32
+
+        samples = sample_inputs_layer_norm(None, device, dtype, requires_grad=False)
+
+        for sample in samples:
+            with self.subTest(sample=sample):
+                # handle optional weight and bias
+                if len(sample.args) != 3:
+                    sample.args = (*sample.args, *([None] * (3 - len(sample.args))))
+
+                grad_out = torch.ones_like(sample.input)
+                normalized_shape, weight, bias = sample.args
+                ndims_after_reduction = sample.input.ndim - len(normalized_shape)
+                mean_shape = grad_out.shape[:ndims_after_reduction]
+                mean = torch.zeros(mean_shape, device=device, dtype=dtype)
+                rstd = torch.zeros(mean_shape, device=device, dtype=dtype)
+
+                expected_shapes = (
+                    sample.input.shape if output_mask[0] else None,
+                    weight.shape if output_mask[1] and weight is not None else None,
+                    bias.shape if output_mask[2] and bias is not None else None)
+
+                args = [grad_out, sample.input, normalized_shape, mean, rstd, weight, bias]
+
+                self._norm_backwards_test_helper(torch.ops.aten.native_layer_norm_backward,
+                                                 args, output_mask, expected_shapes)
+
+    @parametrize("output_mask", list(itertools.product([True, False], [True, False], [True, False])))
+    def test_group_norm_backward(self, output_mask):
+        from torch.testing._internal.common_methods_invocations import sample_inputs_group_norm
+
+        # input, (args) num_groups, (kwargs) weight, bias eps
+        device = "meta"
+        dtype = torch.float32
+        samples = sample_inputs_group_norm(None, device, dtype, requires_grad=False)
+
+        for sample in samples:
+            with self.subTest(sample=sample):
+                grad_out = torch.ones_like(sample.input)
+                N, C = sample.input.shape[:2]
+                HxW = torch.prod(torch.as_tensor(sample.input.shape[2:]), dtype=torch.int32).item()
+                group = sample.args[0]
+                mean = torch.zeros((N, group), device=device, dtype=dtype)
+                rstd = torch.zeros((N, group), device=device, dtype=dtype)
+                weight = torch.zeros((C), device=device, dtype=dtype)
+
+                args = [grad_out, sample.input, mean, rstd, weight, N, C, HxW, group]
+
+                expected_shapes = (
+                    sample.input.shape if output_mask[0] else None,
+                    weight.shape if output_mask[1] else None,
+                    weight.shape if output_mask[2] else None)
+
+                # test functional call
+                self._norm_backwards_test_helper(torch.ops.aten.native_group_norm_backward,
+                                                 args, output_mask, expected_shapes)
+
+    def test_group_norm_channels_last(self):
+        input = torch.empty((2, 32, 8, 8), device="meta").contiguous(
+            memory_format=torch.channels_last
+        )
+        output, mean, rstd = torch.native_group_norm(input, None, None, 2, 32, 64, 4, 1e-5)
+        self.assertTrue(output.is_contiguous(memory_format=torch.channels_last))
+
+        grad_input, _, _ = torch.ops.aten.native_group_norm_backward(
+            torch.empty_like(output), input, mean, rstd, None, 2, 32, 64, 4, (True, False, False)
+        )
+        self.assertTrue(grad_input.is_contiguous(memory_format=torch.channels_last))
+
+    @parametrize("output_mask", list(itertools.product([True], [True, False], [True, False])))
+    def test_batch_norm_backward(self, output_mask):
+        from torch.testing._internal.common_methods_invocations import sample_inputs_batch_norm
+
+        # input, (args) num_groups, (kwargs) weight, bias eps
+        device = "meta"
+        dtype = torch.float32
+        samples = sample_inputs_batch_norm(None, device, dtype, requires_grad=False)
+
+        for sample in samples:
+            with self.subTest(sample=sample):
+
+                if sample.input.dim() < 2:
+                    continue
+
+                grad_out = torch.ones_like(sample.input)
+                running_mean, running_var, weight, bias = sample.args
+                train = sample.kwargs.get("training", True)
+                save_mean = torch.zeros((sample.input.shape[1], ), device=device, dtype=dtype) if train else None
+                save_invstd = torch.zeros((sample.input.shape[1], ), device=device, dtype=dtype) if train else None
+
+                args = [grad_out, sample.input, weight, running_mean, running_var,
+                        save_mean, save_invstd, train, sample.kwargs.get("eps", 1e-5)]
+
+                expected_shapes = (
+                    sample.input.shape,
+                    torch.Size([sample.input.shape[1]]) if output_mask[1] else None,
+                    torch.Size([sample.input.shape[1]]) if output_mask[2] else None)
+
+                self._norm_backwards_test_helper(torch.ops.aten.native_batch_norm_backward,
+                                                 args, output_mask, expected_shapes)
+
+    def test_fill__alias_relationship(self):
+        inps = torch.rand(2**52, device='meta')
+        r = torch.ops.aten.fill_(inps, 1.0)
+        # aten.fill_ returns an alias
+        self.assertEqual(id(inps), id(r))
+
+        # aten.fill returns a new tensor
+        r2 = torch.ops.aten.fill(inps, 1.0)
+        self.assertNotEqual(id(inps), id(r2))
 
     def test_quantized_embedding_bag(self):
         tab_shape = [8, 128]
@@ -1984,46 +2033,6 @@ class TestMeta(TestCase):
             offsets.to('meta'), offset2bag.to('meta'), mode, padding_idx
         )
         self.assertEqual(grad_weight.to('meta'), meta_grad_weight)
-
-    def _assert_fft_meta_stride_matches_eager(self, op, *args):
-        to_meta = MetaConverter()
-        meta_args = tree_map_only(torch.Tensor, to_meta, args)
-        ref_out = op(*args)
-        meta_out = op(*meta_args)
-        self.assertEqual(ref_out.size(), meta_out.size())
-        self.assertEqual(ref_out.stride(), meta_out.stride())
-
-    @onlyCUDA
-    @unittest.skipIf(torch.version.hip, "cuFFT-specific stride behavior")
-    def test_fft_multi_dim_cufft_stride_matches_meta(self, device):
-        self._assert_fft_meta_stride_matches_eager(
-            aten._fft_c2c.default,
-            torch.randn((5, 5, 5, 5, 5), device=device, dtype=torch.complex64),
-            [1, 2, 3, 4],
-            0,
-            True,
-        )
-        self._assert_fft_meta_stride_matches_eager(
-            aten._fft_c2r.default,
-            torch.randn((5, 5, 5, 5, 3), device=device, dtype=torch.complex64),
-            [0, 1, 2, 3, 4],
-            0,
-            5,
-        )
-
-    # opinfo test is using aten.fill_, it's not testing aten.fill
-    @onlyCUDA
-    def test_fill_stride(self):
-        to_meta = MetaConverter()
-        sample_args = [torch.rand(2, 2, 2, 2), 1.0]
-
-        for args in get_strided_args(sample_args):
-            meta_args = to_meta(args)
-            ref_out = torch.ops.aten.fill(*args)
-            meta_out = torch.ops.aten.fill(*meta_args)
-            self.assertEqual(ref_out.size(), meta_out.size())
-            self.assertEqual(ref_out.stride(), meta_out.stride())
-
 
     def test_map_location_deserialize(self):
         import io
@@ -2202,7 +2211,35 @@ class TestMeta(TestCase):
         self.assertEqual(cpu_output_dtype, meta_output_dtype)
         self.assertEqual(cpu_logsumexp_dtype, meta_logsumexp_dtype)
 
+    def test_flash_attention_mixed_head_dim_metadata(self):
+        q_bshd = torch.empty(1, 128, 2, 192, device="meta", dtype=torch.float16)
+        k_bshd = torch.empty_like(q_bshd)
+        v_bshd = torch.empty(1, 128, 2, 128, device="meta", dtype=torch.float16)
+        q, k, v = (tensor.transpose(1, 2) for tensor in (q_bshd, k_bshd, v_bshd))
+
+        output = torch.ops.aten._scaled_dot_product_flash_attention(q, k, v)[0]
+        self.assertEqual(output.shape, v.shape)
+        self.assertEqual(output.stride(), v.stride())
+
+        expanded_q = q[:1, :1].expand(2, 4, -1, -1)
+        expanded_k = k[:1, :1].expand(2, 4, -1, -1)
+        expanded_v = v[:1, :1].expand(2, 4, -1, -1)
+        output = torch.ops.aten._scaled_dot_product_flash_attention(
+            expanded_q, expanded_k, expanded_v
+        )[0]
+        self.assertEqual(output.shape, expanded_v.shape)
+        self.assertEqual(output.stride(), (16384, 32768, 128, 1))
+
+        output = torch.ops.aten._flash_attention_forward(
+            q_bshd, k_bshd, v_bshd, None, None, 128, 128, 0.0, False, False
+        )[0]
+        self.assertEqual(output.shape, v_bshd.shape)
+        self.assertEqual(output.stride(), v_bshd.stride())
+
+
 class TestMetaKernelConv(TestCase):
+    hw_classification = HardwareClassification.GENERIC
+
     @skipIfTorchDynamo("tests raw meta kernel, not dynamo")
     def test_convolution_backward_meta_kernel_channels_last(self):
         """Test the meta kernel directly (device='meta', no FakeTensorMode).
@@ -2256,6 +2293,8 @@ class TestMetaKernelConv(TestCase):
 
 
 class TestMetaKernelRegistrations(TestCase):
+    hw_classification = HardwareClassification.GENERIC
+
     @skipIfTorchDynamo("tests raw meta kernel, not dynamo")
     def test_aminmax_out_dtype_mismatch(self):
         inp = torch.rand(10, 10, device="meta")
@@ -2744,7 +2783,7 @@ class TestMetaKernelRegistrations(TestCase):
         self.assertEqual(diff_b2.shape, expected_bias_shape)
 
 
-instantiate_device_type_tests(TestMeta, globals())
+instantiate_device_type_tests(TestMeta, globals(), only_for='cuda')
 
 
 def print_op_str_if_not_supported(op_str):
