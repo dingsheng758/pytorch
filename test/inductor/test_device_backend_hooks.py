@@ -20,6 +20,8 @@ from torch._inductor.codegen.common import (
     register_device_op_overrides,
 )
 from torch._inductor.runtime.hints import DeviceProperties
+from torch._inductor.kernel.flex.flex_attention import set_float32_precision
+from torch.testing._internal.common_device_type import instantiate_device_type_tests
 from torch.testing._internal.common_utils import (
     HardwareClassification,
     instantiate_parametrized_tests,
@@ -255,6 +257,118 @@ class TestAttentionFusionDeviceHooks(TestCase):
             self.assertTrue(_sfdp_extra_check(fp32_upcast_softmax=True)(match))
         finally:
             di.device_interfaces.pop(fake_device, None)
+
+
+class TestFp32AttentionPrecisionFallback(TestCase):
+    """Device-independent tests for get_fp32_attention_precision().
+
+    These run on every CI job (CPU included) and lock in the base-class
+    default, the "none" -> "ieee" fallback, and the unregistered-device
+    fallback to base defaults.
+    """
+    hw_classification = HardwareClassification.GENERIC
+
+    def test_base_interface_default_is_none(self):
+        """Base DeviceInterface returns "none" so callers fall back to ieee."""
+        self.assertEqual(DeviceInterface.get_fp32_attention_precision(), "none")
+
+    def test_none_falls_back_to_ieee(self):
+        """A device whose interface returns "none" must resolve to ieee."""
+        kernel_options = {}
+        with mock.patch.object(
+            DeviceInterface, "get_fp32_attention_precision", return_value="none"
+        ):
+            set_float32_precision(kernel_options, torch.float32, "cpu")
+        self.assertEqual(kernel_options["FLOAT32_PRECISION"], "'ieee'")
+
+    def test_non_cuda_device_uses_base_default(self):
+        """Non-CUDA registered devices resolve through base DeviceInterface."""
+        kernel_options = {}
+        set_float32_precision(kernel_options, torch.float32, "cpu")
+        self.assertEqual(kernel_options["FLOAT32_PRECISION"], "'ieee'")
+
+    def test_unregistered_device_falls_back(self):
+        """Unregistered device types fall back to base default (ieee)."""
+        kernel_options = {}
+        # "privateuseone" has no registered interface; must not raise.
+        set_float32_precision(kernel_options, torch.float32, "privateuseone")
+        self.assertEqual(kernel_options["FLOAT32_PRECISION"], "'ieee'")
+
+    def test_existing_option_is_not_overwritten(self):
+        """A caller-pinned FLOAT32_PRECISION must not be overwritten."""
+        kernel_options = {"FLOAT32_PRECISION": "'tf32'"}
+        with mock.patch.object(
+            DeviceInterface, "get_fp32_attention_precision", return_value="none"
+        ):
+            set_float32_precision(kernel_options, torch.float32, "cpu")
+        self.assertEqual(kernel_options["FLOAT32_PRECISION"], "'tf32'")
+
+    def test_bfx9_is_ignored_for_non_fp32_dtype(self):
+        """The bfx9 special case only applies to torch.float32."""
+        kernel_options = {}
+        with mock.patch.object(
+            DeviceInterface, "get_fp32_attention_precision", return_value="bfx9"
+        ):
+            set_float32_precision(kernel_options, torch.bfloat16, "cpu")
+        # Must not be resolved through the fp32-only bfx9 branch.
+        self.assertNotEqual(kernel_options["FLOAT32_PRECISION"], "'ieee'")
+
+
+class TestFp32AttentionPrecisionOverrides(TestCase):
+    """CUDA-specific tests for get_fp32_attention_precision().
+
+    All tests are skipped when CUDA is unavailable, so this class can live in
+    a file that also runs on CPU-only CI.
+    """
+    hw_classification = HardwareClassification.CUDA
+
+    def setUp(self):
+        super().setUp()
+        if not torch.cuda.is_available():
+            self.skipTest("requires CUDA")
+
+    def test_cuda_interface_overrides_base(self, device):
+        """CudaInterface overrides the base hook with the real CUDA value."""
+        expected = torch.backends.cuda.matmul.fp32_precision
+        self.assertEqual(CudaInterface.get_fp32_attention_precision(), expected)
+        # Must differ from the base default, proving the override is active.
+        self.assertNotEqual(CudaInterface.get_fp32_attention_precision(), "none")
+
+    def test_bfx9_falls_back_to_ieee(self, device):
+        """bfx9 on fp32 resolves to ieee with a warning."""
+        kernel_options = {}
+        with mock.patch.object(
+            CudaInterface, "get_fp32_attention_precision", return_value="bfx9"
+        ):
+            set_float32_precision(kernel_options, torch.float32, "cuda")
+        self.assertEqual(kernel_options["FLOAT32_PRECISION"], "'ieee'")
+
+    def test_fusion_safe_uses_interface_hook(self, device):
+        """is_fp32_attention_fusion_safe must route through the new hook."""
+        with mock.patch.object(
+            CudaInterface, "get_fp32_attention_precision", return_value="tf32"
+        ):
+            self.assertTrue(CudaInterface.is_fp32_attention_fusion_safe(torch.float32))
+        with mock.patch.object(
+            CudaInterface, "get_fp32_attention_precision", return_value="ieee"
+        ):
+            self.assertFalse(CudaInterface.is_fp32_attention_fusion_safe(torch.float32))
+
+    def test_fusion_safe_non_fp32_always_true(self, device):
+        """Non-fp32 dtypes are always safe regardless of precision policy."""
+        with mock.patch.object(
+            CudaInterface, "get_fp32_attention_precision", return_value="ieee"
+        ):
+            self.assertTrue(CudaInterface.is_fp32_attention_fusion_safe(torch.bfloat16))
+
+    def test_should_warn_tf32_disabled_uses_interface_hook(self, device):
+        """should_warn_tf32_disabled must consult the hook for the bfx9 guard."""
+        with mock.patch.object(
+            CudaInterface, "get_fp32_attention_precision", return_value="bfx9"
+        ):
+            self.assertFalse(CudaInterface.should_warn_tf32_disabled())
+
+instantiate_device_type_tests(TestFp32AttentionPrecisionOverrides, globals(), only_for="cuda")
 
 
 if __name__ == "__main__":
