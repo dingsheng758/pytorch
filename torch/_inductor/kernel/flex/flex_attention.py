@@ -12,7 +12,7 @@ from typing import Any, cast, TYPE_CHECKING
 import sympy
 
 import torch
-from torch._dynamo.device_interface import get_interface_for_device
+from torch._dynamo.device_interface import DeviceInterface, get_interface_for_device
 from torch._inductor.virtualized import V
 from torch._logging import warning_once
 from torch.fx.experimental.symbolic_shapes import statically_known_true, sym_eq
@@ -130,7 +130,10 @@ def flex_attention_grid(batch_size, q_heads, num_queries, d_model, meta, *, cdiv
     return (cdiv(num_queries, meta["BLOCK_M"]), batch_size, q_heads)
 
 def set_float32_precision(kernel_options: dict[str, Any], dtype: torch.dtype, device_type: str) -> None:
-    iface = get_interface_for_device(device_type)
+    try:
+        iface = get_interface_for_device(device_type)
+    except NotImplementedError:
+        iface = DeviceInterface
     precision = iface.get_fp32_attention_precision()
     if precision == "none":
         # Unset at every level of the per-backend hierarchy; the legacy
