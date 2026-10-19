@@ -66,6 +66,19 @@ class DeviceInterface:
         """
         return None
 
+    @staticmethod
+    def create_aoti_runner(
+        model_so_path: str, num_models: int, device_type: str
+    ) -> Callable[..., Any]:
+        """Create an AOTInductor model container runner for this device.
+
+        Returns the runner's ``run`` method. Backends with an AOTI runtime
+        (CUDA, XPU, CPU) override this to build their runner; out-of-tree
+        backends may do the same to plug in their own. Devices without AOTI
+        support leave this unimplemented.
+        """
+        raise NotImplementedError
+
     class device:
         def __new__(cls, device: torch.types.Device) -> Any:
             raise NotImplementedError
@@ -483,6 +496,14 @@ class CudaInterface(DeviceInterface):
         # pick fused backends whose scaling/dropout numerics fail tight checks.
         return torch.version.hip is None
 
+    @staticmethod
+    def create_aoti_runner(
+        model_so_path: str, num_models: int, device_type: str
+    ) -> Callable[..., Any]:
+        return torch._C._aoti.AOTIModelContainerRunnerCuda(  # type: ignore[call-arg]
+            model_so_path, num_models, device_type, "", True
+        ).run  # type: ignore[attr-defined]
+
 
 get_mtia_stream: Callable[[int], int] | None
 if torch.mtia._is_compiled():
@@ -700,6 +721,14 @@ class XpuInterface(DeviceInterface):
         if "intel" not in triton.backends.backends:
             raise TritonUnavailableError("triton not built with the 'intel' backend")
 
+    @staticmethod
+    def create_aoti_runner(
+        model_so_path: str, num_models: int, device_type: str
+    ) -> Callable[..., Any]:
+        return torch._C._aoti.AOTIModelContainerRunnerXpu(  # type: ignore[call-arg]
+            model_so_path, num_models, device_type, ""
+        ).run  # type: ignore[attr-defined]
+
 
 @dataclass
 class CpuDeviceProperties:
@@ -766,6 +795,14 @@ class CpuInterface(DeviceInterface):
         if "cpu" not in triton.backends.backends:
             raise TritonUnavailableError("triton not built with the 'cpu' backend")
 
+    @staticmethod
+    def create_aoti_runner(
+        model_so_path: str, num_models: int, device_type: str
+    ) -> Callable[..., Any]:
+        return torch._C._aoti.AOTIModelContainerRunnerCpu(  # type: ignore[call-arg]
+            model_so_path, num_models
+        ).run  # type: ignore[attr-defined]
+
 
 class MpsInterface(DeviceInterface):
     @staticmethod
@@ -811,6 +848,14 @@ class MpsInterface(DeviceInterface):
         @staticmethod
         def current_device() -> int:
             return 0
+
+    @staticmethod
+    def create_aoti_runner(
+        model_so_path: str, num_models: int, device_type: str
+    ) -> Callable[..., Any]:
+        return torch._C._aoti.AOTIModelContainerRunnerMps(  # type: ignore[call-arg]
+            model_so_path, num_models
+        ).run  # type: ignore[attr-defined]
 
 
 class TpuInterface(DeviceInterface):
